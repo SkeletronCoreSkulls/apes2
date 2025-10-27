@@ -3,7 +3,6 @@ import { ethers } from 'ethers';
 
 const {
   RPC_URL,
-  CHAIN_ID,
   USDC_ADDRESS,
   TREASURY_ADDRESS,
   NFT_CONTRACT_ADDRESS,
@@ -20,57 +19,37 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = OWNER_PRIVATE_KEY ? new ethers.Wallet(OWNER_PRIVATE_KEY, provider) : null;
 
 const ERC20_ABI = ['event Transfer(address indexed from, address indexed to, uint256 value)'];
-const NFT_ABI = [
-  'function mintAfterPayment(address payer, uint256 quantity) external',
-  'function owner() view returns (address)',
-  'function mintEnabled() view returns (bool)',
-  'function totalMinted() view returns (uint256)',
-  'function maxSupply() view returns (uint256)'
-];
+const NFT_ABI = ['function mintAfterPayment(address payer, uint256 quantity) external', 'function owner() view returns (address)'];
 
 const nft = NFT_CONTRACT_ADDRESS && wallet
   ? new ethers.Contract(NFT_CONTRACT_ADDRESS, NFT_ABI, wallet)
   : null;
 
 const processedTxs = new Set();
-const PRICE = BigInt(X402_PRICE_USDC || '10000000'); // default 10 USDC
+const PRICE = BigInt(X402_PRICE_USDC || '10000000'); // 10 USDC
 
-function asChecksum(addr) { return ethers.getAddress(addr); }
-function ensureAddr(name, v) { try { asChecksum(v); } catch { throw new Error(`Invalid address for ${name}: ${v}`); } }
-[['USDC_ADDRESS', USDC_ADDRESS], ['TREASURY_ADDRESS', TREASURY_ADDRESS], ['NFT_CONTRACT_ADDRESS', NFT_CONTRACT_ADDRESS]]
-  .forEach(([n, v]) => v && ensureAddr(n, v));
-
+// Validate USDC payment and return payer
 async function verifyUsdcPayment(txHash) {
   const receipt = await provider.getTransactionReceipt(txHash);
   if (!receipt) throw new Error('Transaction not found');
-  if (receipt.status !== 1) throw new Error('Transaction failed on-chain');
+  if (receipt.status !== 1) throw new Error('Transaction failed');
 
   const iface = new ethers.Interface(ERC20_ABI);
   const usdcLC = USDC_ADDRESS.toLowerCase();
   const treasLC = TREASURY_ADDRESS.toLowerCase();
 
-  let payer = null;
-  let paid = 0n;
-
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== usdcLC) continue;
-    try {
-      const parsed = iface.parseLog({ topics: log.topics, data: log.data });
-      if (parsed?.name === 'Transfer') {
-        const to = parsed.args.to.toLowerCase();
-        const value = BigInt(parsed.args.value.toString());
-        if (to === treasLC) {
-          paid += value;
-          if (!payer) payer = parsed.args.from;
-        }
-      }
-    } catch {}
+    const parsed = iface.parseLog({ topics: log.topics, data: log.data });
+    if (parsed.name === 'Transfer' && parsed.args.to.toLowerCase() === treasLC) {
+      const value = BigInt(parsed.args.value.toString());
+      if (value >= PRICE) return ethers.getAddress(parsed.args.from);
+    }
   }
-  if (!payer) throw new Error('No USDC Transfer to TREASURY found in tx');
-  if (paid < PRICE) throw new Error(`Insufficient amount: paid=${paid} required=${PRICE}`);
-  return ethers.getAddress(payer);
+  throw new Error('No valid USDC payment found');
 }
 
+// Build schema for x402scan
 function x402Response() {
   return {
     x402Version: Number(X402_VERSION || 1),
@@ -78,86 +57,48 @@ function x402Response() {
       {
         scheme: "exact",
         network: X402_NETWORK || "base",
-        maxAmountRequired: (PRICE ?? 0n).toString(),
+        maxAmountRequired: PRICE.toString(),
         resource: X402_RESOURCE || "mint:x402apes:1",
-        description: "Mint one x402Apes NFT after a confirmed USDC payment to the treasury.",
+        description: "Mint one x402Apes NFT automatically after USDC payment confirmation.",
         mimeType: "application/json",
         payTo: TREASURY_ADDRESS,
         maxTimeoutSeconds: Number(X402_MAX_TIMEOUT_SECONDS || 600),
         asset: X402_ASSET || "USDC",
         outputSchema: {
-          input: {
-            type: "http",
-            method: "POST",
-            bodyType: "json",
-            bodyFields: {
-              resource: { type: "string", required: true, description: "Must match the resource identifier" },
-              txHash: { type: "string", required: true, description: "USDC payment tx hash on Base" }
-            }
-          },
-          output: {
-            ok: true,
-            mintedTo: "0x...",
-            nftTxHash: "0x...",
-            note: "Always mints exactly 1 NFT to the payer."
-          }
+          input: { type: "http", method: "POST", bodyType: "json" },
+          output: { ok: true, mintedTo: "0x...", nftTxHash: "0x...", note: "Mint completed." }
         },
-        extra: { project: "x402Apes", onePerCall: true }
+        extra: { autoConfirm: true, onePerPayment: true, project: "x402Apes" }
       }
     ]
   };
 }
 
+// ✅ Handler
 export default async function handler(req, res) {
   try {
+    // x402scan discovery → respond 402 with schema
     if (req.method === 'GET') {
-      // Debug opcional
-      if (req.query.debug === 'state' && nft && wallet) {
-        const net = await provider.getNetwork();
-        const info = {
-          chainId: net.chainId.toString(),
-          contract: NFT_CONTRACT_ADDRESS,
-          signer: wallet.address,
-          onchainOwner: await nft.owner(),
-          mintEnabled: await nft.mintEnabled(),
-          totalMinted: (await nft.totalMinted()).toString(),
-          maxSupply: (await nft.maxSupply()).toString()
-        };
-        return res.status(200).json(info);
-      }
-
-      // *** CLAVE: responder 402 para discovery de x402scan ***
       res.setHeader('Content-Type', 'application/json');
       return res.status(402).json(x402Response());
     }
 
+    // x402scan notify → confirm payment automatically
     if (req.method === 'POST') {
-      if (!wallet || !nft) throw new Error('Server misconfigured: missing OWNER_PRIVATE_KEY or NFT_CONTRACT_ADDRESS');
-      const { resource, txHash } = req.body || {};
-      if (!resource || !txHash) return res.status(400).json({ error: 'Missing resource or txHash' });
-      if (resource !== (X402_RESOURCE || 'mint:x402apes:1')) return res.status(400).json({ error: 'Invalid resource' });
+      const { txHash } = req.body || {};
+      if (!txHash) return res.status(400).json({ error: 'Missing txHash from x402' });
       if (processedTxs.has(txHash)) return res.status(200).json({ ok: true, note: 'Already processed', txHash });
-
-      // Pre-check owner vs signer
-      const onchainOwner = await nft.owner();
-      if (onchainOwner.toLowerCase() !== wallet.address.toLowerCase()) {
-        return res.status(400).json({
-          x402Version: Number(X402_VERSION || 1),
-          error: 'Misconfiguration: signer is not contract owner',
-          details: { onchainOwner, signer: wallet.address, contract: NFT_CONTRACT_ADDRESS }
-        });
-      }
 
       const payer = await verifyUsdcPayment(txHash);
       const tx = await nft.mintAfterPayment(payer, 1, { gasLimit: 300000n });
-      const rec = await tx.wait();
+      const receipt = await tx.wait();
 
       processedTxs.add(txHash);
       return res.status(200).json({
         ok: true,
         mintedTo: payer,
-        nftTxHash: rec.hash,
-        note: 'Minted exactly 1 NFT to payer after verified USDC payment.'
+        nftTxHash: receipt.hash,
+        note: 'Minted automatically after USDC payment confirmation.'
       });
     }
 
@@ -166,7 +107,7 @@ export default async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({
       x402Version: Number(X402_VERSION || 1),
-      error: err?.message || 'Internal error'
+      error: err?.message || 'Internal server error'
     });
   }
 }
