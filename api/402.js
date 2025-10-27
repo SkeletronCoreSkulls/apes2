@@ -19,9 +19,7 @@ const {
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = OWNER_PRIVATE_KEY ? new ethers.Wallet(OWNER_PRIVATE_KEY, provider) : null;
 
-const ERC20_ABI = [
-  'event Transfer(address indexed from, address indexed to, uint256 value)'
-];
+const ERC20_ABI = ['event Transfer(address indexed from, address indexed to, uint256 value)'];
 const NFT_ABI = [
   'function mintAfterPayment(address payer, uint256 quantity) external',
   'function owner() view returns (address)',
@@ -38,9 +36,7 @@ const processedTxs = new Set();
 const PRICE = BigInt(X402_PRICE_USDC || '10000000'); // default 10 USDC
 
 function asChecksum(addr) { return ethers.getAddress(addr); }
-function ensureAddr(name, v) {
-  try { asChecksum(v); } catch { throw new Error(`Invalid address for ${name}: ${v}`); }
-}
+function ensureAddr(name, v) { try { asChecksum(v); } catch { throw new Error(`Invalid address for ${name}: ${v}`); } }
 [['USDC_ADDRESS', USDC_ADDRESS], ['TREASURY_ADDRESS', TREASURY_ADDRESS], ['NFT_CONTRACT_ADDRESS', NFT_CONTRACT_ADDRESS]]
   .forEach(([n, v]) => v && ensureAddr(n, v));
 
@@ -115,7 +111,7 @@ function x402Response() {
 export default async function handler(req, res) {
   try {
     if (req.method === 'GET') {
-      // Debug mode ?debug=state → shows current signer/owner status
+      // Debug opcional
       if (req.query.debug === 'state' && nft && wallet) {
         const net = await provider.getNetwork();
         const info = {
@@ -130,24 +126,19 @@ export default async function handler(req, res) {
         return res.status(200).json(info);
       }
 
-      const resp = x402Response();
-      return res.status(200).json(resp);
+      // *** CLAVE: responder 402 para discovery de x402scan ***
+      res.setHeader('Content-Type', 'application/json');
+      return res.status(402).json(x402Response());
     }
 
     if (req.method === 'POST') {
       if (!wallet || !nft) throw new Error('Server misconfigured: missing OWNER_PRIVATE_KEY or NFT_CONTRACT_ADDRESS');
       const { resource, txHash } = req.body || {};
       if (!resource || !txHash) return res.status(400).json({ error: 'Missing resource or txHash' });
+      if (resource !== (X402_RESOURCE || 'mint:x402apes:1')) return res.status(400).json({ error: 'Invalid resource' });
+      if (processedTxs.has(txHash)) return res.status(200).json({ ok: true, note: 'Already processed', txHash });
 
-      if (resource !== (X402_RESOURCE || 'mint:x402apes:1')) {
-        return res.status(400).json({ error: 'Invalid resource' });
-      }
-
-      if (processedTxs.has(txHash)) {
-        return res.status(200).json({ ok: true, note: 'Already processed', txHash });
-      }
-
-      // --- PATCH: Pre-check signer vs owner ---
+      // Pre-check owner vs signer
       const onchainOwner = await nft.owner();
       if (onchainOwner.toLowerCase() !== wallet.address.toLowerCase()) {
         return res.status(400).json({
