@@ -24,7 +24,10 @@ const ERC20_ABI = [
 ];
 const NFT_ABI = [
   'function mintAfterPayment(address payer, uint256 quantity) external',
-  'function owner() view returns (address)'
+  'function owner() view returns (address)',
+  'function mintEnabled() view returns (bool)',
+  'function totalMinted() view returns (uint256)',
+  'function maxSupply() view returns (uint256)'
 ];
 
 const nft = NFT_CONTRACT_ADDRESS && wallet
@@ -38,7 +41,7 @@ function asChecksum(addr) { return ethers.getAddress(addr); }
 function ensureAddr(name, v) {
   try { asChecksum(v); } catch { throw new Error(`Invalid address for ${name}: ${v}`); }
 }
-[ ['USDC_ADDRESS', USDC_ADDRESS], ['TREASURY_ADDRESS', TREASURY_ADDRESS], ['NFT_CONTRACT_ADDRESS', NFT_CONTRACT_ADDRESS] ]
+[['USDC_ADDRESS', USDC_ADDRESS], ['TREASURY_ADDRESS', TREASURY_ADDRESS], ['NFT_CONTRACT_ADDRESS', NFT_CONTRACT_ADDRESS]]
   .forEach(([n, v]) => v && ensureAddr(n, v));
 
 async function verifyUsdcPayment(txHash) {
@@ -110,32 +113,69 @@ function x402Response() {
 }
 
 export default async function handler(req, res) {
-  if (req.method === 'GET') {
-    const resp = x402Response();
-    return res.status(200).json(resp);
-  }
+  try {
+    if (req.method === 'GET') {
+      // Debug mode ?debug=state → shows current signer/owner status
+      if (req.query.debug === 'state' && nft && wallet) {
+        const net = await provider.getNetwork();
+        const info = {
+          chainId: net.chainId.toString(),
+          contract: NFT_CONTRACT_ADDRESS,
+          signer: wallet.address,
+          onchainOwner: await nft.owner(),
+          mintEnabled: await nft.mintEnabled(),
+          totalMinted: (await nft.totalMinted()).toString(),
+          maxSupply: (await nft.maxSupply()).toString()
+        };
+        return res.status(200).json(info);
+      }
 
-  if (req.method === 'POST') {
-    try {
+      const resp = x402Response();
+      return res.status(200).json(resp);
+    }
+
+    if (req.method === 'POST') {
       if (!wallet || !nft) throw new Error('Server misconfigured: missing OWNER_PRIVATE_KEY or NFT_CONTRACT_ADDRESS');
       const { resource, txHash } = req.body || {};
       if (!resource || !txHash) return res.status(400).json({ error: 'Missing resource or txHash' });
-      if (resource !== (X402_RESOURCE || 'mint:x402apes:1'))
+
+      if (resource !== (X402_RESOURCE || 'mint:x402apes:1')) {
         return res.status(400).json({ error: 'Invalid resource' });
-      if (processedTxs.has(txHash))
+      }
+
+      if (processedTxs.has(txHash)) {
         return res.status(200).json({ ok: true, note: 'Already processed', txHash });
+      }
+
+      // --- PATCH: Pre-check signer vs owner ---
+      const onchainOwner = await nft.owner();
+      if (onchainOwner.toLowerCase() !== wallet.address.toLowerCase()) {
+        return res.status(400).json({
+          x402Version: Number(X402_VERSION || 1),
+          error: 'Misconfiguration: signer is not contract owner',
+          details: { onchainOwner, signer: wallet.address, contract: NFT_CONTRACT_ADDRESS }
+        });
+      }
 
       const payer = await verifyUsdcPayment(txHash);
       const tx = await nft.mintAfterPayment(payer, 1, { gasLimit: 300000n });
       const rec = await tx.wait();
 
       processedTxs.add(txHash);
-      return res.status(200).json({ ok: true, mintedTo: payer, nftTxHash: rec.hash, note: 'Minted exactly 1 NFT to payer after verified USDC payment.' });
-    } catch (err) {
-      return res.status(500).json({ x402Version: Number(X402_VERSION || 1), error: err?.message || 'Internal error' });
+      return res.status(200).json({
+        ok: true,
+        mintedTo: payer,
+        nftTxHash: rec.hash,
+        note: 'Minted exactly 1 NFT to payer after verified USDC payment.'
+      });
     }
-  }
 
-  res.setHeader('Allow', 'GET, POST');
-  return res.status(405).json({ error: 'Method not allowed' });
+    res.setHeader('Allow', 'GET, POST');
+    return res.status(405).json({ error: 'Method not allowed' });
+  } catch (err) {
+    return res.status(500).json({
+      x402Version: Number(X402_VERSION || 1),
+      error: err?.message || 'Internal error'
+    });
+  }
 }
